@@ -7,7 +7,6 @@ export async function register() {
 }
 
 // Next.jsが捕捉したリクエスト処理エラーをログに残す
-// loggerは動的importにすること (静的importだとPinoInstrumentationのpatch前に読み込まれてtraceIdが付かない)
 export const onRequestError: Instrumentation.onRequestError = async (err) => {
   const { logger } = await import("@/lib/logger");
   logger.error(err);

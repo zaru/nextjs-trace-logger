@@ -12,7 +12,9 @@
 
 ### 採用方針
 
-**Next.jsが内部で生成するOpenTelemetryスパンに乗っかり、`@vercel/otel` + `instrumentation-pino` でpinoの全ログにtraceIdを自動付与する。**
+**Next.jsが内部で生成するOpenTelemetryスパンに乗っかり、`@vercel/otel` + 自作loggerで全ログにtraceIdを自動付与する。**
+
+自作loggerは `@opentelemetry/api` の `trace.getActiveSpan()` から直接traceId/spanIdを読み取るため、pino等の外部ロガーやその計装パッケージは不要。
 
 トレースデータ自体の送信 (Jaeger / Datadog / X-Ray等への送信) は **行わない**。あくまでログにIDを載せるためだけにOpenTelemetryを使う。後でトレース送信を追加したくなった場合も、本構成のまま `traceExporter` を足すだけで拡張可能。
 
@@ -62,34 +64,25 @@ npm install @vercel/otel \
             @opentelemetry/sdk-logs \
             @opentelemetry/api-logs \
             @opentelemetry/instrumentation \
-            @opentelemetry/instrumentation-pino \
-            @opentelemetry/propagator-aws-xray \
-            pino
+            @opentelemetry/propagator-aws-xray
 ```
 
 各パッケージの役割:
 
 - `@vercel/otel`: Next.jsとOpenTelemetryのブリッジ。ESM loader hookやpatchタイミングを面倒見てくれる
-- `@opentelemetry/api`: トレースAPI
+- `@opentelemetry/api`: トレースAPI。自作loggerが `trace.getActiveSpan()` でtraceId/spanIdを取得するのに使う
 - `@opentelemetry/sdk-logs`, `@opentelemetry/api-logs`, `@opentelemetry/instrumentation`: `@vercel/otel`が要求する peer dependency
-- `@opentelemetry/instrumentation-pino`: pinoのログ出力にtraceIdを自動で混ぜる
 - `@opentelemetry/propagator-aws-xray`: AWSの `X-Amzn-Trace-Id` ヘッダの解釈用 (ALB/API Gatewayが付ける)
-- `pino`: ロガー本体
 
 ### 3.2 `next.config.ts` の設定
 
-`instrumentation-pino` と `pino` をNext.jsのバンドルから除外する必要がある (instrumentationはランタイムでモジュールを差し替えるため、バンドルされると効かない)。
+自作loggerは外部パッケージではないため `serverExternalPackages` の設定は不要。デフォルト設定のままでよい。
 
 ```ts
 // next.config.ts
 import type { NextConfig } from 'next';
 
-const nextConfig: NextConfig = {
-  serverExternalPackages: [
-    '@opentelemetry/instrumentation-pino',
-    'pino',
-  ],
-};
+const nextConfig: NextConfig = {};
 
 export default nextConfig;
 ```
@@ -109,9 +102,8 @@ export async function register() {
   // edgeランタイムは今回対象外。使うなら別途設定が必要
 }
 
-// Next.jsが捕捉したリクエスト処理エラーもログに残す
+// Next.jsが捕捉したリクエスト処理エラーをログに残す
 export const onRequestError: Instrumentation.onRequestError = async (err) => {
-  // instrumentation.node 側でpinoがpatchされているため、動的importでないとtraceIdが付かない
   const { logger } = await import('@/lib/logger');
   logger.error(err);
 };
@@ -123,9 +115,8 @@ export const onRequestError: Instrumentation.onRequestError = async (err) => {
 
 ```ts
 // instrumentation.node.ts
-import { registerOTel } from '@vercel/otel';
-import { PinoInstrumentation } from '@opentelemetry/instrumentation-pino';
 import { AWSXRayPropagator } from '@opentelemetry/propagator-aws-xray';
+import { registerOTel } from '@vercel/otel';
 
 registerOTel({
   serviceName: 'YOUR_SERVICE_NAME', // ← 各環境のサービス名に置き換える
@@ -134,21 +125,8 @@ registerOTel({
   // "auto" を併用することで既定のW3C Trace Context (traceparent) も継続して扱える
   propagators: ['auto', new AWSXRayPropagator()],
 
-  instrumentations: [
-    new PinoInstrumentation({
-      // pinoが出すログ1行ごとに呼ばれる。spanからtraceIdを取り出してログに混ぜる
-      logHook: (span, record) => {
-        const ctx = span.spanContext();
-        record.requestId = ctx.traceId; // ← ログに付くキー名。チームの命名規約に合わせて変更可
-        record.spanId = ctx.spanId;
-
-        // PinoInstrumentationのデフォルトキー(trace_id, span_id, trace_flags)は使わないので削除
-        delete record.trace_id;
-        delete record.span_id;
-        delete record.trace_flags;
-      },
-    }),
-  ],
+  // 自作loggerが @opentelemetry/api の active span を直接読むため
+  // pino用のinstrumentationは不要
 
   // 今回はトレースデータの送信は行わないので traceExporter は指定しない
   // 後で送信したくなったら traceExporter: new OTLPTraceExporter({ url: ... }) を追加
@@ -157,16 +135,74 @@ registerOTel({
 
 ### 3.5 `lib/logger.ts` の作成
 
+外部ロガーを使わず、`@opentelemetry/api` の active span から直接 traceId/spanId を読む自作logger。
+
+- pino互換の呼び出しインターフェース (`logger.info(msg)`, `logger.info(obj, msg)`, `logger.error(err)`)
+- `LOG_LEVEL` 環境変数でレベルフィルタ
+- TTY環境ではカラー付きpretty出力、それ以外では1行JSON出力
+- pinoと同じレベル数値 (trace=10, debug=20, info=30, warn=40, error=50, fatal=60)
+
 ```ts
 // lib/logger.ts
-import pino from 'pino';
+import { trace } from '@opentelemetry/api';
 
-export const logger = pino({
-  level: process.env.LOG_LEVEL ?? 'info',
-  // production向けの基本設定。本番環境ではJSON出力、開発環境で見やすくしたければ
-  // pino-pretty を別途入れて transport を切り替える
-});
+const LEVELS = {
+  trace: 10, debug: 20, info: 30, warn: 40, error: 50, fatal: 60,
+} as const;
+
+type LevelName = keyof typeof LEVELS;
+
+const threshold = LEVELS[(process.env.LOG_LEVEL ?? 'info') as LevelName] ?? LEVELS.info;
+const isTTY = process.stdout.isTTY === true;
+
+function getTraceContext() {
+  const span = trace.getActiveSpan();
+  if (!span) return undefined;
+  const ctx = span.spanContext();
+  if (!ctx.traceId || ctx.traceId === '00000000000000000000000000000000') return undefined;
+  return { requestId: ctx.traceId, spanId: ctx.spanId };
+}
+
+function emit(levelName: LevelName, obj: Record<string, unknown> | undefined, msg: string) {
+  const levelNum = LEVELS[levelName];
+  if (levelNum < threshold) return;
+  const traceCtx = getTraceContext();
+
+  if (isTTY) {
+    // カラー付きpretty出力 (開発環境向け)
+    // ...省略 (実装は lib/logger.ts を参照)
+    return;
+  }
+
+  const record: Record<string, unknown> = { level: levelNum, time: Date.now(), ...obj, msg };
+  if (traceCtx) {
+    record.requestId = traceCtx.requestId;
+    record.spanId = traceCtx.spanId;
+  }
+  process.stdout.write(JSON.stringify(record) + '\n');
+}
+
+function log(levelName: LevelName, first: unknown, second?: string) {
+  if (first instanceof Error) {
+    emit(levelName, { type: first.name, message: first.message, stack: first.stack }, first.message);
+  } else if (typeof first === 'object' && first !== null && typeof second === 'string') {
+    emit(levelName, first as Record<string, unknown>, second);
+  } else {
+    emit(levelName, undefined, String(first));
+  }
+}
+
+export const logger = {
+  trace: (first: unknown, second?: string) => log('trace', first, second),
+  debug: (first: unknown, second?: string) => log('debug', first, second),
+  info:  (first: unknown, second?: string) => log('info',  first, second),
+  warn:  (first: unknown, second?: string) => log('warn',  first, second),
+  error: (first: unknown, second?: string) => log('error', first, second),
+  fatal: (first: unknown, second?: string) => log('fatal', first, second),
+};
 ```
+
+> **Note**: この自作loggerはこのプロジェクトで使っているAPI範囲のみ互換。pinoの child logger, redaction, transport, stream差し替え等の機能は含まない。
 
 ### 3.6 完成: アプリ側の利用
 
@@ -343,17 +379,9 @@ OTEL_TRACES_SAMPLER_ARG=0.1   # 10%サンプリング
 
 `instrumentation.ts` / `instrumentation.node.ts` はサーバ起動時に1回だけ評価される。変更したらHMRでは反映されないので、`npm run dev` を再起動する。
 
-### 5.6 ログ出力時の動的import
+### 5.6 pino完全互換ではない
 
-`onRequestError` 内のloggerは **動的import** にすること。静的importだとPinoInstrumentationがpatchを当てる前にloggerが読み込まれ、traceIdが付かない:
-
-```ts
-// NG: 静的import
-import { logger } from '@/lib/logger';
-
-// OK: 動的import
-const { logger } = await import('@/lib/logger');
-```
+自作loggerはこのプロジェクトで使っているAPI範囲 (`logger.info(msg)`, `logger.info(obj, msg)`, `logger.error(err)`) のみ互換。pinoの child logger, bindings, redaction, transport, extreme mode, stream差し替え等の機能は含まない。必要になった場合は後続フェーズで拡張するか、pinoに戻す。
 
 ---
 
@@ -363,11 +391,11 @@ const { logger } = await import('@/lib/logger');
 
 確認順:
 
-1. `next.config.ts` の `serverExternalPackages` に `@opentelemetry/instrumentation-pino` と `pino` が両方入っているか
-2. `instrumentation.ts` が **プロジェクトルート (または src/) 直下** にあるか (`app/` 配下はNG)
-3. サーバ起動ログに `@vercel/otel: started ...` のような行が出ているか
-4. `process.env.NEXT_RUNTIME` が `nodejs` になっているか (Edgeランタイムでは動かない)
-5. loggerが **静的importでなく**、instrumentation登録**後**にimportされているか
+1. `instrumentation.ts` が **プロジェクトルート (または src/) 直下** にあるか (`app/` 配下はNG)
+2. サーバ起動ログに `@vercel/otel: started ...` のような行が出ているか
+3. `process.env.NEXT_RUNTIME` が `nodejs` になっているか (Edgeランタイムでは動かない)
+4. `lib/logger.ts` が `@opentelemetry/api` の `trace` を正しくimportしているか
+5. ログを出すコードがリクエストコンテキスト内 (Route Handler / Server Action / Dynamic Page) で実行されているか
 
 ### Q. ローカルで `ECONNREFUSED 127.0.0.1:4318` のエラーが出る
 
@@ -379,7 +407,7 @@ OTEL_TRACES_EXPORTER=none
 
 ### Q. デプロイ後にtraceIdが全リクエストで同じ値になる
 
-`@vercel/otel` のpatchが効いていない可能性が高い。`next.config.ts` の `serverExternalPackages` の設定漏れか、ビルド時にinstrumentation.tsが含まれていない (例: standaloneビルド時の出力漏れ)。Dockerfileで `instrumentation.ts` と `instrumentation.node.ts` を含めることを確認する。
+`@vercel/otel` のpatchが効いていない可能性が高い。ビルド時にinstrumentation.tsが含まれていない (例: standaloneビルド時の出力漏れ)。Dockerfileで `instrumentation.ts` と `instrumentation.node.ts` を含めることを確認する。
 
 ### Q. Server Componentから呼んだログにtraceIdが付かない
 
@@ -391,7 +419,7 @@ Next.jsのServer Componentの一部 (Static Renderingされるもの) はリク�
 
 - [Next.js OpenTelemetry公式ガイド](https://nextjs.org/docs/app/guides/open-telemetry)
 - [@vercel/otel npm](https://www.npmjs.com/package/@vercel/otel)
-- [@opentelemetry/instrumentation-pino](https://github.com/open-telemetry/opentelemetry-js-contrib/tree/main/plugins/node/opentelemetry-instrumentation-pino)
+- [@opentelemetry/api](https://www.npmjs.com/package/@opentelemetry/api) — 自作loggerが `trace.getActiveSpan()` に使う
 - [@opentelemetry/propagator-aws-xray](https://www.npmjs.com/package/@opentelemetry/propagator-aws-xray)
 - [Next.jsでサーバーサイドログにリクエストごとのユニークなIDを付与する (Zenn)](https://zenn.dev/terass_dev/articles/ce859811ab36af) — 本構成の参考元
 
@@ -399,8 +427,7 @@ Next.jsのServer Componentの一部 (Static Renderingされるもの) はリク�
 
 ## 8. チェックリスト (実装担当向け)
 
-- [ ] 上記6パッケージを `package.json` に追加 (3.1)
-- [ ] `next.config.ts` に `serverExternalPackages` を設定 (3.2)
+- [ ] 上記5パッケージを `package.json` に追加 (3.1)
 - [ ] `instrumentation.ts` を作成 (3.3)
 - [ ] `instrumentation.node.ts` を作成、`serviceName` を埋める (3.4)
 - [ ] `lib/logger.ts` を作成 (3.5)
