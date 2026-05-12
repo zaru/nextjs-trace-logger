@@ -1,6 +1,7 @@
 "use server";
 
 import { processFakeTask } from "@/lib/fake-backend";
+import { logger } from "@/lib/logger";
 
 export type ActionResult = {
   message: string;
@@ -11,6 +12,7 @@ export async function runDemoAction(
   formData: FormData,
 ): Promise<ActionResult> {
   const taskName = String(formData.get("taskName") || "demo-task");
+  logger.info({ taskName }, "runDemoAction called");
   const message = await processFakeTask(taskName);
   return { message };
 }

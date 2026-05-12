@@ -1,8 +1,12 @@
 import { fetchFakeUsers } from "@/lib/fake-backend";
+import { logger } from "@/lib/logger";
 import { RouteHandlerClient } from "./_components/route-handler-client";
 import { ServerActionForm } from "./_components/server-action-form";
 
+export const dynamic = "force-dynamic";
+
 export default async function Home() {
+  logger.info("rendering Home page");
   const users = await fetchFakeUsers();
 
   return (
