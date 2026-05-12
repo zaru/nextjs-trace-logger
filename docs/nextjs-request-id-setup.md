@@ -42,7 +42,7 @@ export const GET = async () => {
 
 ```json
 {
-  "level": 30,
+  "level": "info",
   "time": 1731000000000,
   "msg": "fetching users",
   "requestId": "4bf92f3577b34da6a3ce929d0e0e4736",
@@ -102,10 +102,20 @@ export async function register() {
   // edgeランタイムは今回対象外。使うなら別途設定が必要
 }
 
+function getErrorDigest(err: unknown) {
+  if (typeof err !== 'object' || err === null || !('digest' in err)) {
+    return undefined;
+  }
+  return typeof err.digest === 'string' ? err.digest : undefined;
+}
+
 // Next.jsが捕捉したリクエスト処理エラーをログに残す
 export const onRequestError: Instrumentation.onRequestError = async (err) => {
   const { logger } = await import('@/lib/logger');
-  logger.error(err);
+  logger.error('request error captured by Next.js', {
+    digest: getErrorDigest(err),
+    error: err instanceof Error ? err : new Error(String(err)),
+  });
 };
 ```
 
@@ -137,23 +147,16 @@ registerOTel({
 
 外部ロガーを使わず、`@opentelemetry/api` の active span から直接 traceId/spanId を読む自作logger。
 
-- pino互換の呼び出しインターフェース (`logger.info(msg)`, `logger.info(obj, msg)`, `logger.error(err)`)
-- `LOG_LEVEL` 環境変数でレベルフィルタ
-- TTY環境ではカラー付きpretty出力、それ以外では1行JSON出力
-- pinoと同じレベル数値 (trace=10, debug=20, info=30, warn=40, error=50, fatal=60)
+- 明示的な呼び出しインターフェース (`logger.info(message, meta?)`, `logger.error(message, { error, ...meta })`)
+- 出力は常に1行JSON
+- レベルは `info` / `error` の2種類のみ
 
 ```ts
 // lib/logger.ts
 import { trace } from '@opentelemetry/api';
 
-const LEVELS = {
-  trace: 10, debug: 20, info: 30, warn: 40, error: 50, fatal: 60,
-} as const;
-
-type LevelName = keyof typeof LEVELS;
-
-const threshold = LEVELS[(process.env.LOG_LEVEL ?? 'info') as LevelName] ?? LEVELS.info;
-const isTTY = process.stdout.isTTY === true;
+type LevelName = 'info' | 'error';
+type LogMeta = Record<string, unknown>;
 
 function getTraceContext() {
   const span = trace.getActiveSpan();
@@ -163,46 +166,52 @@ function getTraceContext() {
   return { requestId: ctx.traceId, spanId: ctx.spanId };
 }
 
-function emit(levelName: LevelName, obj: Record<string, unknown> | undefined, msg: string) {
-  const levelNum = LEVELS[levelName];
-  if (levelNum < threshold) return;
-  const traceCtx = getTraceContext();
+function serializeError(err: Error) {
+  return {
+    type: err.name,
+    message: err.message,
+    stack: err.stack,
+  };
+}
 
-  if (isTTY) {
-    // カラー付きpretty出力 (開発環境向け)
-    // ...省略 (実装は lib/logger.ts を参照)
-    return;
+function normalizeMeta(meta?: LogMeta) {
+  if (!meta) return undefined;
+  if (meta.error instanceof Error) {
+    return { ...meta, error: serializeError(meta.error) };
   }
+  return meta;
+}
 
-  const record: Record<string, unknown> = { level: levelNum, time: Date.now(), ...obj, msg };
+function normalizeRecord(levelName: LevelName, message: string, meta?: LogMeta) {
+  const traceCtx = getTraceContext();
+  const normalizedMeta = normalizeMeta(meta);
+  const record: Record<string, unknown> = {
+    level: levelName,
+    time: Date.now(),
+    ...(normalizedMeta ?? {}),
+    msg: message,
+  };
   if (traceCtx) {
     record.requestId = traceCtx.requestId;
     record.spanId = traceCtx.spanId;
   }
-  process.stdout.write(JSON.stringify(record) + '\n');
+  return record;
 }
 
-function log(levelName: LevelName, first: unknown, second?: string) {
-  if (first instanceof Error) {
-    emit(levelName, { type: first.name, message: first.message, stack: first.stack }, first.message);
-  } else if (typeof first === 'object' && first !== null && typeof second === 'string') {
-    emit(levelName, first as Record<string, unknown>, second);
-  } else {
-    emit(levelName, undefined, String(first));
-  }
+function writeRecord(levelName: LevelName, record: Record<string, unknown>) {
+  const output = JSON.stringify(record);
+  process.stdout.write(output + '\n');
 }
 
 export const logger = {
-  trace: (first: unknown, second?: string) => log('trace', first, second),
-  debug: (first: unknown, second?: string) => log('debug', first, second),
-  info:  (first: unknown, second?: string) => log('info',  first, second),
-  warn:  (first: unknown, second?: string) => log('warn',  first, second),
-  error: (first: unknown, second?: string) => log('error', first, second),
-  fatal: (first: unknown, second?: string) => log('fatal', first, second),
+  info: (message: string, meta?: LogMeta) =>
+    writeRecord('info', normalizeRecord('info', message, meta)),
+  error: (message: string, meta?: LogMeta) =>
+    writeRecord('error', normalizeRecord('error', message, meta)),
 };
 ```
 
-> **Note**: この自作loggerはこのプロジェクトで使っているAPI範囲のみ互換。pinoの child logger, redaction, transport, stream差し替え等の機能は含まない。
+> **Note**: この自作loggerは `message + meta` の最小APIだけを提供する。child logger, bindings, redaction, transport, pretty出力の切り替えは含まない。
 
 ### 3.6 完成: アプリ側の利用
 
@@ -227,7 +236,7 @@ export const GET = async () => {
 import { logger } from '@/lib/logger';
 
 export async function createPost(formData: FormData) {
-  logger.info({ title: formData.get('title') }, 'creating post');
+  logger.info('creating post', { title: formData.get('title') });
   // ...
 }
 ```
@@ -262,7 +271,7 @@ curl http://localhost:3000/api/users
 
 ```json
 {
-  "level": 30,
+  "level": "info",
   "time": 1731000000000,
   "msg": "fetching users",
   "requestId": "4bf92f3577b34da6a3ce929d0e0e4736",
@@ -379,9 +388,9 @@ OTEL_TRACES_SAMPLER_ARG=0.1   # 10%サンプリング
 
 `instrumentation.ts` / `instrumentation.node.ts` はサーバ起動時に1回だけ評価される。変更したらHMRでは反映されないので、`npm run dev` を再起動する。
 
-### 5.6 pino完全互換ではない
+### 5.6 pino互換ではない
 
-自作loggerはこのプロジェクトで使っているAPI範囲 (`logger.info(msg)`, `logger.info(obj, msg)`, `logger.error(err)`) のみ互換。pinoの child logger, bindings, redaction, transport, extreme mode, stream差し替え等の機能は含まない。必要になった場合は後続フェーズで拡張するか、pinoに戻す。
+自作loggerは `logger.info(message, meta?)` / `logger.error(message, { error, ...meta })` のような最小APIのみを提供する。pinoの child logger, bindings, redaction, transport, extreme mode, pretty出力, stream差し替え等の機能は含まない。必要になった場合は後続フェーズで拡張するか、pinoに戻す。
 
 ---
 

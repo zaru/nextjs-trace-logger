@@ -6,15 +6,12 @@ export function proxy(req: NextRequest) {
   const { method } = req;
   const { pathname, search } = req.nextUrl;
 
-  logger.info(
-    {
-      method,
-      path: pathname + search,
-      userAgent: req.headers.get("user-agent") ?? undefined,
-      referer: req.headers.get("referer") ?? undefined,
-    },
-    "incoming request",
-  );
+  logger.info("incoming request", {
+    method,
+    path: pathname + search,
+    userAgent: req.headers.get("user-agent") ?? undefined,
+    referer: req.headers.get("referer") ?? undefined,
+  });
 
   // OTelコンテキストをリクエストヘッダに注入する
   // proxy(middleware)とRoute Handler/Page間でtraceIdがずれる既知問題 (Next.js #80445) の回避策

@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { fetchFakeUsers } from "@/lib/fake-backend";
 import { logger } from "@/lib/logger";
 import { RouteHandlerClient } from "./_components/route-handler-client";
@@ -7,6 +8,9 @@ export const dynamic = "force-dynamic";
 
 export default async function Home() {
   logger.info("rendering Home page");
+  logger.info({ pos: "before" }, "rendering Home page");
+  logger.info("rendering Home page", { pos: "after" });
+  logger.info({ pos: "only" });
   const users = await fetchFakeUsers();
 
   return (
@@ -59,6 +63,22 @@ export default async function Home() {
           fetch し、Route Handler のレスポンスを表示する。
         </p>
         <RouteHandlerClient />
+      </section>
+
+      {/* エラーデモ */}
+      <section className="border border-red-200 rounded-lg p-6 space-y-4 bg-red-50/30">
+        <h2 className="text-lg font-semibold text-red-800">
+          🚨 エラー発生デモ
+        </h2>
+        <p className="text-sm text-zinc-500">
+          Server Action やデータフェッチで意図的にエラーを発生させるデモページ。
+        </p>
+        <Link
+          href="/error-demo"
+          className="inline-block bg-red-600 text-white rounded px-4 py-2 text-sm hover:bg-red-700"
+        >
+          エラーデモページへ →
+        </Link>
       </section>
     </main>
   );

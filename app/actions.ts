@@ -12,7 +12,7 @@ export async function runDemoAction(
   formData: FormData,
 ): Promise<ActionResult> {
   const taskName = String(formData.get("taskName") || "demo-task");
-  logger.info({ taskName }, "runDemoAction called");
+  logger.info("runDemoAction called", { taskName });
   const message = await processFakeTask(taskName);
   return { message };
 }

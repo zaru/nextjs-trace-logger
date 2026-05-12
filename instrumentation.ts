@@ -6,8 +6,20 @@ export async function register() {
   }
 }
 
+function getErrorDigest(err: unknown): string | undefined {
+  if (typeof err !== "object" || err === null || !("digest" in err)) {
+    return undefined;
+  }
+
+  const { digest } = err;
+  return typeof digest === "string" ? digest : undefined;
+}
+
 // Next.jsが捕捉したリクエスト処理エラーをログに残す
 export const onRequestError: Instrumentation.onRequestError = async (err) => {
   const { logger } = await import("@/lib/logger");
-  logger.error(err);
+  logger.error("request error captured by Next.js", {
+    digest: getErrorDigest(err),
+    error: err instanceof Error ? err : new Error(String(err)),
+  });
 };
