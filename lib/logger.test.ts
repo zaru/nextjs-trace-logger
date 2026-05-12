@@ -95,7 +95,6 @@ describe("logger", () => {
   it("supports all logger argument forms", () => {
     logger.info("message only");
     logger.info("message with meta", { pos: "after" });
-    logger.info({ pos: "before" }, "meta before message");
     logger.info({ pos: "only" });
 
     expect(readRecords()).toEqual([
@@ -105,21 +104,15 @@ describe("logger", () => {
         msg: "message only",
       },
       {
-        pos: "after",
         level: "info",
         time: NOW,
         msg: "message with meta",
+        pos: "after",
       },
       {
-        pos: "before",
         level: "info",
         time: NOW,
-        msg: "meta before message",
-      },
-      {
         pos: "only",
-        level: "info",
-        time: NOW,
       },
     ]);
   });

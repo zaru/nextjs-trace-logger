@@ -19,11 +19,6 @@ function getStdout(): NodeJS.WriteStream | undefined {
   return undefined;
 }
 
-const CONSOLE_METHOD: Record<LevelName, LevelName> = {
-  info: "info",
-  error: "error",
-};
-
 function getTraceContext(): { requestId: string; spanId: string } | undefined {
   const span = trace.getActiveSpan();
   if (!span) return undefined;
@@ -39,6 +34,9 @@ function serializeError(err: Error): Record<string, unknown> {
     type: err.name,
     message: err.message,
     stack: err.stack,
+    ...(err.cause !== undefined && {
+      cause: err.cause instanceof Error ? serializeError(err.cause) : err.cause,
+    }),
   };
 }
 
@@ -58,7 +56,6 @@ function normalizeMeta(meta?: LogMeta): LogMeta | undefined {
 type LogArgs =
   | [message: string]
   | [message: string, meta: LogMeta]
-  | [meta: LogMeta, message: string]
   | [meta: LogMeta];
 
 function parseLogArgs(args: LogArgs): {
@@ -70,9 +67,11 @@ function parseLogArgs(args: LogArgs): {
       ? { message: args[0] }
       : { message: undefined, meta: args[0] };
   }
-  return typeof args[0] === "string"
-    ? { message: args[0], meta: args[1] as LogMeta }
-    : { message: args[1] as string, meta: args[0] as LogMeta };
+  if (args.length >= 2) {
+    return { message: args[0], meta: args[1] };
+  }
+  // length === 0: runtime safety guard
+  return { message: undefined };
 }
 
 function normalizeRecord(
@@ -83,14 +82,17 @@ function normalizeRecord(
   const traceCtx = getTraceContext();
   const normalizedMeta = normalizeMeta(meta);
 
+  // Reserved fields first (JSON key order); they are never overridden by meta.
   const record: Record<string, unknown> = {
-    ...(normalizedMeta ?? {}),
     level: levelName,
     time: Date.now(),
+    ...(message !== undefined ? { msg: message } : {}),
   };
 
-  if (message !== undefined) {
-    record.msg = message;
+  if (normalizedMeta) {
+    for (const [k, v] of Object.entries(normalizedMeta)) {
+      if (!(k in record)) record[k] = v;
+    }
   }
 
   if (traceCtx) {
@@ -102,44 +104,45 @@ function normalizeRecord(
 }
 
 function safeStringify(value: unknown): string {
-  const seen = new WeakSet<object>();
+  const ancestors: unknown[] = [];
 
-  return JSON.stringify(value, (_key, currentValue: unknown) => {
+  return JSON.stringify(value, function (_key, currentValue: unknown) {
     if (typeof currentValue === "bigint") {
       return currentValue.toString();
     }
 
+    if (currentValue instanceof Error) {
+      return serializeError(currentValue);
+    }
+
     if (typeof currentValue === "object" && currentValue !== null) {
-      if (seen.has(currentValue)) {
+      while (ancestors.length > 0 && ancestors.at(-1) !== this) {
+        ancestors.pop();
+      }
+      if (ancestors.includes(currentValue)) {
         return "[Circular]";
       }
-      seen.add(currentValue);
+      ancestors.push(currentValue);
     }
 
     return currentValue;
   });
 }
 
-function writeRecord(
-  levelName: LevelName,
-  record: Record<string, unknown>,
-): void {
-  const output = safeStringify(record);
-  const stdout = getStdout();
-  if (stdout) {
-    stdout.write(`${output}\n`);
-  } else {
-    console[CONSOLE_METHOD[levelName]](output);
-  }
+function createLogger(levelName: LevelName) {
+  return (...args: LogArgs) => {
+    const { message, meta } = parseLogArgs(args);
+    const output = safeStringify(normalizeRecord(levelName, message, meta));
+    const stdout = getStdout();
+    if (stdout) {
+      stdout.write(`${output}\n`);
+    } else {
+      console[levelName](output);
+    }
+  };
 }
 
 export const logger = {
-  info: (...args: LogArgs) => {
-    const { message, meta } = parseLogArgs(args);
-    writeRecord("info", normalizeRecord("info", message, meta));
-  },
-  error: (...args: LogArgs) => {
-    const { message, meta } = parseLogArgs(args);
-    writeRecord("error", normalizeRecord("error", message, meta));
-  },
+  info: createLogger("info"),
+  error: createLogger("error"),
 };
