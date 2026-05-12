@@ -14,7 +14,21 @@ type LevelName = keyof typeof LEVELS;
 const threshold =
   LEVELS[(process.env.LOG_LEVEL ?? "info") as LevelName] ?? LEVELS.info;
 
-const isTTY = process.stdout.isTTY === true;
+// Edge Runtime では process.stdout が存在しないため動的にアクセスする
+// Turbopack の静的解析が process.stdout リテラルを Edge 非互換として警告するため
+// プロパティアクセスを間接化して回避する
+const stdoutKey = "stdout" as const;
+
+function getStdout(): NodeJS.WriteStream | undefined {
+  if (
+    typeof process !== "undefined" &&
+    process[stdoutKey] &&
+    typeof process[stdoutKey].write === "function"
+  ) {
+    return process[stdoutKey];
+  }
+  return undefined;
+}
 
 const COLORS: Record<LevelName, string> = {
   trace: "\x1b[90m", // gray
@@ -25,6 +39,15 @@ const COLORS: Record<LevelName, string> = {
   fatal: "\x1b[35m", // magenta
 };
 const RESET = "\x1b[0m";
+
+const CONSOLE_METHOD: Record<LevelName, "debug" | "info" | "warn" | "error"> = {
+  trace: "debug",
+  debug: "debug",
+  info: "info",
+  warn: "warn",
+  error: "error",
+  fatal: "error",
+};
 
 function getTraceContext(): { requestId: string; spanId: string } | undefined {
   const span = trace.getActiveSpan();
@@ -49,6 +72,15 @@ function formatPrettyTime(): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
+function write(levelName: LevelName, output: string): void {
+  const stdout = getStdout();
+  if (stdout) {
+    stdout.write(output);
+  } else {
+    console[CONSOLE_METHOD[levelName]](output);
+  }
+}
+
 function emit(
   levelName: LevelName,
   obj: Record<string, unknown> | undefined,
@@ -58,8 +90,9 @@ function emit(
   if (levelNum < threshold) return;
 
   const traceCtx = getTraceContext();
+  const stdout = getStdout();
 
-  if (isTTY) {
+  if (stdout?.isTTY) {
     const color = COLORS[levelName];
     const time = formatPrettyTime();
     const traceStr = traceCtx
@@ -67,7 +100,8 @@ function emit(
       : "";
     const objStr =
       obj && Object.keys(obj).length > 0 ? ` ${JSON.stringify(obj)}` : "";
-    process.stdout.write(
+    write(
+      levelName,
       `${RESET}\x1b[90m[${time}]${RESET} ${color}${levelName.toUpperCase().padEnd(5)}${RESET} ${msg}${objStr}${traceStr}\n`,
     );
     return;
@@ -83,7 +117,7 @@ function emit(
     record.requestId = traceCtx.requestId;
     record.spanId = traceCtx.spanId;
   }
-  process.stdout.write(`${JSON.stringify(record)}\n`);
+  write(levelName, `${JSON.stringify(record)}\n`);
 }
 
 function log(levelName: LevelName, first: unknown, second?: string): void {
