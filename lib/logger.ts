@@ -84,9 +84,9 @@ function normalizeRecord(
   const normalizedMeta = normalizeMeta(meta);
 
   const record: Record<string, unknown> = {
+    ...(normalizedMeta ?? {}),
     level: levelName,
     time: Date.now(),
-    ...(normalizedMeta ?? {}),
   };
 
   if (message !== undefined) {
@@ -101,11 +101,30 @@ function normalizeRecord(
   return record;
 }
 
+function safeStringify(value: unknown): string {
+  const seen = new WeakSet<object>();
+
+  return JSON.stringify(value, (_key, currentValue: unknown) => {
+    if (typeof currentValue === "bigint") {
+      return currentValue.toString();
+    }
+
+    if (typeof currentValue === "object" && currentValue !== null) {
+      if (seen.has(currentValue)) {
+        return "[Circular]";
+      }
+      seen.add(currentValue);
+    }
+
+    return currentValue;
+  });
+}
+
 function writeRecord(
   levelName: LevelName,
   record: Record<string, unknown>,
 ): void {
-  const output = JSON.stringify(record);
+  const output = safeStringify(record);
   const stdout = getStdout();
   if (stdout) {
     stdout.write(`${output}\n`);
